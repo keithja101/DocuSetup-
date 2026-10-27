@@ -1,0 +1,378 @@
+
+name: Build, Sign and Release DocuSetup
+
+on:
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Release tag, for example v1.0.0.0"
+        required: true
+        type: string
+
+permissions:
+  contents: write
+
+jobs:
+  build-sign-release:
+    name: Build, Sign and Release DocuSetup
+    runs-on: windows-latest
+    environment: docusetup-signing
+
+    steps:
+
+      # ==========================================================
+      # 1. Validate release tag
+      # ==========================================================
+
+      - name: Validate Release Tag
+        shell: pwsh
+        env:
+          RELEASE_TAG: ${{ inputs.tag }}
+        run: |
+          $tag = $env:RELEASE_TAG
+
+          if ([string]::IsNullOrWhiteSpace($tag)) {
+              throw "Release tag cannot be empty."
+          }
+
+          if ($tag -notmatch '^v[0-9]+(\.[0-9]+)*$') {
+              throw "Invalid release tag. Use a version such as v1.0.0.0."
+          }
+
+          Write-Host "Release tag: $tag"
+
+      # ==========================================================
+      # 2. Checkout source
+      # ==========================================================
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # ==========================================================
+      # 3. Setup .NET
+      # ==========================================================
+
+      - name: Setup .NET
+        uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "10.0.x"
+
+      # ==========================================================
+      # 4. Restore
+      # Update the solution path if your repository differs.
+      # ==========================================================
+
+      - name: Restore
+        shell: pwsh
+        run: |
+          dotnet restore .\DocuSetup.slnx
+
+      # ==========================================================
+      # 5. Build
+      # ==========================================================
+
+      - name: Build
+        shell: pwsh
+        run: |
+          dotnet build .\DocuSetup.slnx `
+            -c Release `
+            --no-restore
+
+      # ==========================================================
+      # 6. Publish single-file SetupInstaller.exe
+      # Update the project path if your repository differs.
+      # ==========================================================
+
+      - name: Publish SetupInstaller
+        shell: pwsh
+        run: |
+          $publishDir = Join-Path $env:GITHUB_WORKSPACE "publish"
+
+          dotnet publish `
+              .\DocuSetup\DocuSetup.csproj `
+              -c Release `
+              -r win-x64 `
+              --self-contained true `
+              --no-restore `
+              -p:PublishSingleFile=true `
+              -p:IncludeNativeLibrariesForSelfExtract=true `
+              -p:EnableCompressionInSingleFile=true `
+              -p:PublishTrimmed=false `
+              -p:AssemblyName=SetupInstaller `
+              -o "$publishDir"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "dotnet publish failed with exit code $LASTEXITCODE."
+          }
+
+          $publishedExe = Join-Path $publishDir "SetupInstaller.exe"
+
+          if (-not (Test-Path $publishedExe)) {
+              throw "SetupInstaller.exe was not produced by dotnet publish."
+          }
+
+          $file = Get-Item $publishedExe
+
+          Write-Host "Published installer:"
+          Write-Host $file.FullName
+          Write-Host "Size: $($file.Length) bytes"
+
+          if ($file.Length -lt 100000) {
+              throw "SetupInstaller.exe appears unexpectedly small."
+          }
+
+      # ==========================================================
+      # 7. Decode DocuSetup signing certificate
+      # ==========================================================
+
+      - name: Decode DocuSetup Signing Certificate
+        shell: pwsh
+        env:
+          BASE64_PFX: ${{ secrets.DOCUSETUP_PFX_BASE64 }}
+        run: |
+          if ([string]::IsNullOrWhiteSpace($env:BASE64_PFX)) {
+              throw "DOCUSETUP_PFX_BASE64 secret is missing."
+          }
+
+          $certificatePath = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "docusetup_signing.pfx"
+
+          try {
+              $bytes = [Convert]::FromBase64String($env:BASE64_PFX)
+              [IO.File]::WriteAllBytes($certificatePath, $bytes)
+          }
+          catch {
+              throw "DOCUSETUP_PFX_BASE64 is not valid Base64."
+          }
+
+          if (-not (Test-Path $certificatePath)) {
+              throw "DocuSetup signing certificate could not be created."
+          }
+
+          $size = (Get-Item $certificatePath).Length
+
+          Write-Host "Temporary DocuSetup PFX created."
+          Write-Host "PFX size: $size bytes"
+
+      # ==========================================================
+      # 8. Locate SignTool
+      # ==========================================================
+
+      - name: Locate SignTool
+        id: signtool
+        shell: pwsh
+        run: |
+          $signtool = Get-ChildItem `
+              -Path "C:\Program Files (x86)\Windows Kits" `
+              -Filter "signtool.exe" `
+              -Recurse `
+              -ErrorAction SilentlyContinue |
+              Where-Object {
+                  $_.FullName -match "\\x64\\signtool\.exe$"
+              } |
+              Sort-Object FullName -Descending |
+              Select-Object -First 1
+
+          if (-not $signtool) {
+              throw "SignTool.exe could not be found."
+          }
+
+          Write-Host "Using SignTool:"
+          Write-Host $signtool.FullName
+
+          "PATH=$($signtool.FullName)" >> $env:GITHUB_OUTPUT
+
+      # ==========================================================
+      # 9. Sign SetupInstaller.exe
+      # ==========================================================
+
+      - name: Sign SetupInstaller.exe
+        shell: pwsh
+        env:
+          CERT_PASSWORD: ${{ secrets.DOCUSETUP_CERT_PASSWORD }}
+        run: |
+          $signtool = "${{ steps.signtool.outputs.PATH }}"
+          $certificate = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "docusetup_signing.pfx"
+          $exe = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "publish\SetupInstaller.exe"
+
+          if (-not (Test-Path $certificate)) {
+              throw "DocuSetup signing certificate does not exist."
+          }
+
+          if (-not (Test-Path $exe)) {
+              throw "SetupInstaller.exe does not exist."
+          }
+
+          if ([string]::IsNullOrWhiteSpace($env:CERT_PASSWORD)) {
+              throw "DOCUSETUP_CERT_PASSWORD secret is missing."
+          }
+
+          & $signtool sign `
+              /f "$certificate" `
+              /p "$env:CERT_PASSWORD" `
+              /fd SHA256 `
+              /tr "http://timestamp.digicert.com" `
+              /td SHA256 `
+              /d "DocuSetup Installer" `
+              "$exe"
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "SignTool failed with exit code $LASTEXITCODE."
+          }
+
+          Write-Host "SetupInstaller.exe signed successfully."
+
+      # ==========================================================
+      # 10. Verify Authenticode signature and certificate
+      # ==========================================================
+
+      - name: Verify Digital Signature
+        shell: pwsh
+        env:
+          EXPECTED_THUMBPRINT: ${{ secrets.DOCUSETUP_CERT_THUMBPRINT }}
+        run: |
+          $exe = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "publish\SetupInstaller.exe"
+
+          if ([string]::IsNullOrWhiteSpace($env:EXPECTED_THUMBPRINT)) {
+              throw "DOCUSETUP_CERT_THUMBPRINT secret is missing."
+          }
+
+          $signature = Get-AuthenticodeSignature $exe
+
+          Write-Host "Signature Status:"
+          Write-Host $signature.Status
+
+          if (-not $signature.SignerCertificate) {
+              throw "No signing certificate was found."
+          }
+
+          $actual = $signature.SignerCertificate.Thumbprint.
+              Replace(" ", "").ToUpperInvariant()
+
+          $expected = $env:EXPECTED_THUMBPRINT.
+              Replace(" ", "").ToUpperInvariant()
+
+          Write-Host "Signer:"
+          Write-Host $signature.SignerCertificate.Subject
+
+          Write-Host "Thumbprint:"
+          Write-Host $actual
+
+          Write-Host "Certificate expires:"
+          Write-Host $signature.SignerCertificate.NotAfter
+
+          if ($actual -ne $expected) {
+              throw "Signing certificate thumbprint does not match the expected DocuSetup certificate."
+          }
+
+          if ($signature.Status -ne "Valid") {
+              throw "Authenticode verification failed: $($signature.Status)"
+          }
+
+          Write-Host "Authenticode signature is valid."
+          Write-Host "DocuSetup certificate thumbprint verified."
+
+      # ==========================================================
+      # 11. Generate SHA-256
+      # ==========================================================
+
+      - name: Generate SHA-256
+        shell: pwsh
+        run: |
+          $exe = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "publish\SetupInstaller.exe"
+
+          $hash = (
+              Get-FileHash -Path $exe -Algorithm SHA256
+          ).Hash
+
+          Write-Host "SHA-256:"
+          Write-Host $hash
+
+          "$hash  SetupInstaller.exe" |
+              Out-File `
+                  (Join-Path $env:GITHUB_WORKSPACE "SetupInstaller.exe.sha256") `
+                  -Encoding ascii
+
+      # ==========================================================
+      # 12. Create GitHub Release
+      # Only SetupInstaller.exe is uploaded.
+      # ==========================================================
+
+      - name: Create GitHub Release
+        shell: pwsh
+        env:
+          GH_TOKEN: ${{ github.token }}
+          RELEASE_TAG: ${{ inputs.tag }}
+          REPOSITORY: ${{ github.repository }}
+        run: |
+          $tag = $env:RELEASE_TAG
+          $exe = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "publish\SetupInstaller.exe"
+
+          gh release create `
+              "$tag" `
+              "$exe" `
+              --repo "$env:REPOSITORY" `
+              --title "DocuSetup Installer $tag" `
+              --generate-notes
+
+          if ($LASTEXITCODE -ne 0) {
+              throw "Failed to create GitHub release $tag."
+          }
+
+          Write-Host "GitHub release created successfully."
+          Write-Host "Only SetupInstaller.exe was uploaded."
+
+      # ==========================================================
+      # 13. Destroy temporary signing certificate
+      # ==========================================================
+
+      - name: Destroy Temporary Certificate
+        if: always()
+        shell: pwsh
+        run: |
+          $certificate = Join-Path `
+              $env:GITHUB_WORKSPACE `
+              "docusetup_signing.pfx"
+
+          if (Test-Path $certificate) {
+              Remove-Item "$certificate" `
+                  -Force `
+                  -ErrorAction SilentlyContinue
+
+              Write-Host "Temporary DocuSetup PFX deleted."
+          }
+
+      # ==========================================================
+      # 14. Clean runner files
+      # ==========================================================
+
+      - name: Clean Runner Files
+        if: always()
+        shell: pwsh
+        run: |
+          $files = @(
+              (Join-Path $env:GITHUB_WORKSPACE "publish\SetupInstaller.exe"),
+              (Join-Path $env:GITHUB_WORKSPACE "SetupInstaller.exe.sha256"),
+              (Join-Path $env:GITHUB_WORKSPACE "docusetup_signing.pfx")
+          )
+
+          foreach ($file in $files) {
+              if (Test-Path $file) {
+                  Remove-Item "$file" `
+                      -Force `
+                      -ErrorAction SilentlyContinue
+              }
+          }
+
+          Write-Host "Temporary runner files cleaned."
